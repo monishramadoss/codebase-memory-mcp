@@ -298,13 +298,14 @@ inv_index_cli() {
         fail "index-cli" "index_repository crashed (signal $((CLI_RC-128)))"
         return
     fi
-    # The text payload carries {"...","nodes":N,...}. Pull the max integer that
-    # follows a "nodes": key.
+    # The tool result wraps its payload as a JSON STRING, so the node count appears
+    # escaped (\"nodes\":N) and the logs use nodes=N. Strip backslashes + quotes and
+    # match either "nodes": / nodes= form; any nodes>0 satisfies "graph non-empty".
     local nodes
     nodes="$(printf '%s' "$CLI_OUT" | "$PY" -c '
 import sys,re
-t=sys.stdin.read()
-m=re.findall(r"\"nodes\"\s*:\s*(\d+)", t)
+t=sys.stdin.read().replace("\\","").replace("\"","")
+m=re.findall(r"nodes\s*[:=]\s*(\d+)", t)
 print(max((int(x) for x in m), default=0))' 2>/dev/null)"
     if [ "${nodes:-0}" -gt 0 ] 2>/dev/null; then
         pass "index-cli (nodes=$nodes, rc=$CLI_RC)"
@@ -320,8 +321,12 @@ inv_index_status_cli() {
         fail "index-status" "crashed (signal $((CLI_RC-128)))"
         return
     fi
-    if printf '%s' "$CLI_OUT" | grep -q '"status":"ready"' && \
-       printf '%s' "$CLI_OUT" | grep -qE '"nodes":[1-9]'; then
+    # Result payload is a JSON string with escaped quotes (\"status\":\"ready\"); strip
+    # backslashes so the unescaped greps match.
+    local st_clean
+    st_clean="$(printf '%s' "$CLI_OUT" | tr -d '\\')"
+    if printf '%s' "$st_clean" | grep -q '"status":"ready"' && \
+       printf '%s' "$st_clean" | grep -qE '"nodes":[1-9]'; then
         pass "index-status (ready, non-empty)"
     else
         fail "index-status" "not ready/non-empty; out=[$(printf '%s' "$CLI_OUT" | tr '\n' ' ' | cut -c1-200)]"
