@@ -175,13 +175,37 @@ void cbm_mem_init(double ram_fraction) {
 }
 
 size_t cbm_mem_rss(void) {
+#if defined(__linux__)
+    /* Linux: mimalloc's _mi_prim_process_info() (vendored/mimalloc/src/prim/
+     * unix/prim.c) never sets pinfo->current_rss on Linux — it only sets
+     * peak_rss (from getrusage's ru_maxrss). current_rss therefore keeps
+     * mi_process_info()'s default of pinfo.current_commit: mimalloc's OWN
+     * committed-page counter, which this project deliberately tunes low via
+     * mi_option_arena_eager_commit=0 + purge_decommits=1 + purge_delay=0
+     * (cbm_mem_init) to reduce upfront memory. So on Linux "current_rss" is a
+     * low-biased mimalloc-internal metric, not true RSS: under concurrent
+     * large-file parsing it can read a few MB while real RSS is multiple GB,
+     * silently blinding cbm_mem_over_budget()'s backpressure to real memory
+     * pressure (small-but-nonzero, so the `current_rss > 0` guard below never
+     * catches it). os_rss() reads /proc/self/statm — authoritative OS RSS,
+     * unaffected by mimalloc's accounting — so it is the PRIMARY source on
+     * Linux, not a last-resort fallback. macOS/Windows are unaffected:
+     * mimalloc sets current_rss correctly there via task_info /
+     * GetProcessMemoryInfo. */
+    size_t proc_rss = os_rss();
+    if (proc_rss > 0) {
+        return proc_rss;
+    }
+    /* Extremely unlikely (/proc unavailable) — fall through to mimalloc. */
+#endif
     size_t current_rss = 0;
     size_t peak_rss = 0;
     mi_process_info(NULL, NULL, NULL, &current_rss, &peak_rss, NULL, NULL, NULL);
     if (current_rss > 0) {
         return current_rss;
     }
-    /* Fallback for ASan builds (MI_OVERRIDE=0) */
+    /* Fallback for ASan builds (MI_OVERRIDE=0) and any platform where
+     * mimalloc's current_rss is unavailable/zero. */
     return os_rss();
 }
 

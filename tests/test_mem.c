@@ -16,6 +16,10 @@
 
 #include <stdatomic.h>
 #include <sys/stat.h>
+#include <mimalloc.h>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 
 /* ASan detection — mimalloc MI_OVERRIDE=0 under ASan, mi_process_info
  * may return 0 for RSS. Tests that depend on accurate RSS must skip. */
@@ -203,6 +207,69 @@ TEST(mem_collect_no_crash) {
     cbm_mem_init(0.5);
     /* collect() must not crash even with nothing to collect */
     cbm_mem_collect();
+    PASS();
+}
+
+/* Reproduce-first guard for the Linux cbm_mem_rss() undercount (distilled
+ * from #776's 132460f5).
+ *
+ * On Linux, mimalloc's mi_process_info() never sets current_rss
+ * (vendored/mimalloc/src/prim/unix/prim.c only fills peak_rss from
+ * getrusage's ru_maxrss); current_rss silently keeps mi_process_info()'s
+ * default of pinfo.current_commit — mimalloc's OWN committed-page counter
+ * (stats.c:555). The UNFIXED cbm_mem_rss() returns that counter whenever it is
+ * nonzero, so on Linux it reports mimalloc-committed bytes, NOT true RSS. The
+ * FIXED code reads /proc/self/statm (os_rss) as the primary source → true RSS.
+ *
+ * The guard makes the two quantities DIVERGE deterministically:
+ *   1. mi_malloc() a small block (kept live) so mimalloc's committed counter is
+ *      a small POSITIVE value — this both defeats the UNFIXED `current_rss > 0`
+ *      fallback guard AND pins the reported value low. mi_malloc always routes
+ *      through mimalloc regardless of MI_OVERRIDE, so this works in the ASan
+ *      test-runner (MI_OVERRIDE=0) too.
+ *   2. Grow TRUE process RSS by ~256MB via a raw anonymous mmap — memory
+ *      mimalloc's committed counter never sees, but /proc/self/statm does.
+ * On UNFIXED Linux, cbm_mem_rss() then returns the ~few-MB committed counter
+ * (< 128MB) → this assertion FAILS (RED). On FIXED Linux it returns the /proc
+ * RSS (>= 256MB) → GREEN.
+ *
+ * macOS/Windows set current_rss from task_info/GetProcessMemoryInfo, which DO
+ * include the mapped+touched region, so cbm_mem_rss() is accurate there both
+ * before and after the fix — this passes on those platforms either way. The
+ * RED therefore manifests only on the Linux CI leg, which is exactly where the
+ * production undercount bit (backpressure/ceiling blinded). */
+TEST(mem_rss_reflects_external_resident_memory) {
+    cbm_mem_init(0.5);
+
+    /* (1) Pin mimalloc's committed-page counter to a small positive value. */
+    const size_t warm = (size_t)1 * 1024 * 1024; /* 1 MB via mimalloc */
+    void *mi_buf = mi_malloc(warm);
+    ASSERT_NOT_NULL(mi_buf);
+    memset(mi_buf, 0x11, warm);
+
+    const size_t region = (size_t)256 * 1024 * 1024;    /* 256 MB true RSS */
+    const size_t threshold = (size_t)128 * 1024 * 1024; /* generous half */
+
+#ifdef _WIN32
+    /* Windows current_rss (WorkingSetSize) is accurate; a plain resident
+     * allocation is reflected regardless of allocator. No Linux undercount. */
+    void *big = malloc(region);
+    ASSERT_NOT_NULL(big);
+    memset(big, 0x5A, region);
+    size_t rss = cbm_mem_rss();
+    ASSERT_GTE(rss, threshold);
+    free(big);
+#else
+    /* (2) Raw mmap bypasses mimalloc entirely: its committed counter does NOT
+     * grow, but the true RSS does — this is what exposes the Linux undercount. */
+    void *big = mmap(NULL, region, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_TRUE(big != MAP_FAILED);
+    memset(big, 0x5A, region); /* fault every page in → resident */
+    size_t rss = cbm_mem_rss();
+    ASSERT_GTE(rss, threshold);
+    munmap(big, region);
+#endif
+    mi_free(mi_buf);
     PASS();
 }
 
@@ -829,6 +896,7 @@ SUITE(mem) {
     RUN_TEST(mem_rss_positive);
     RUN_TEST(mem_peak_rss_gte_rss);
     RUN_TEST(mem_rss_increases_after_alloc);
+    RUN_TEST(mem_rss_reflects_external_resident_memory);
     RUN_TEST(mem_collect_no_crash);
     RUN_TEST(mem_collect_rss_still_positive);
     /* Memory pressure simulation */
