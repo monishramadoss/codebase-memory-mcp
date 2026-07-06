@@ -513,11 +513,14 @@ TEST(lsp_python_deep_expression_no_crash) {
 }
 
 TEST(lsp_perl_deep_expression_no_crash) {
-    /* Deeply nested Perl call expressions f(f(f(...f(1)...))). The Perl AST
-     * walkers (perl_resolve_calls_in_node / perl_pass1_scan) recurse per child
-     * with no depth bound before QA round 1 — the same SIGSEGV-prone shape as
-     * the Java/C++ walkers. The CBM_LSP_PERL_MAX_WALK_DEPTH guard must cap the
-     * recursion so this does not overflow the stack. See
+    /* Deeply nested Perl call expressions f(f(f(...f(1)...))). Unlike the
+     * Java/C++ cases, the overflow here is NOT in the LSP walk — it is in
+     * tree-sitter's own GLR parser: stack_node_add_link (vendored
+     * ts_runtime/src/stack.c) recurses once per nesting level while merging the
+     * ambiguous parse-stack heads that Perl's `f(...)` grammar produces, blowing
+     * a small (1 MB Windows) stack during the parse, before any LSP walk runs.
+     * The CBM_PERL_MAX_PARSE_NESTING pre-parse guard in cbm_extract_file skips
+     * such input so it never reaches tree-sitter. See
      * lsp_java_deep_nesting_no_crash on the depth choice. */
     const int DEPTH = 30000;
     size_t sz = (size_t)DEPTH * 3 + 256;
