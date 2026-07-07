@@ -1,6 +1,13 @@
 import { useEffect, useState, useCallback, useMemo } from "react";
 import { Button } from "@/components/ui/button";
-import { useGraphData } from "../hooks/useGraphData";
+import {
+  useGraphData,
+  clampNodeBudget,
+  GRAPH_RENDER_NODE_LIMIT,
+  GRAPH_NODE_BUDGET_STEP,
+  GRAPH_NODE_BUDGET_MAX,
+} from "../hooks/useGraphData";
+import { GraphLoader } from "./GraphLoader";
 import {
   GraphScene,
   computeCameraTarget,
@@ -26,17 +33,32 @@ function saveWidth(key: string, value: number) {
   try { localStorage.setItem(key, String(Math.round(value))); } catch { /* ignore */ }
 }
 
+/* Persist the node budget per project */
+function budgetKey(project: string): string {
+  return `cbm-node-budget:${project}`;
+}
+function loadNodeBudget(project: string): number {
+  try {
+    const v = localStorage.getItem(budgetKey(project));
+    if (v) return clampNodeBudget(parseInt(v, 10));
+  } catch { /* ignore */ }
+  return GRAPH_RENDER_NODE_LIMIT;
+}
+function saveNodeBudget(project: string, value: number) {
+  try { localStorage.setItem(budgetKey(project), String(value)); } catch { /* ignore */ }
+}
+
 interface GraphTabProps {
   project: string | null;
 }
 
 export function formatGraphLimitNotice(data: GraphData | null): string | null {
   if (!data || data.total_nodes <= data.nodes.length) return null;
-  return `Showing ${data.nodes.length.toLocaleString("en-US")} of ${data.total_nodes.toLocaleString("en-US")} nodes. Use filters to narrow.`;
+  return `Showing ${data.nodes.length.toLocaleString("en-US")} of ${data.total_nodes.toLocaleString("en-US")} nodes (${data.edges.length.toLocaleString("en-US")} edges). Raise the node budget or use filters.`;
 }
 
 export function GraphTab({ project }: GraphTabProps) {
-  const { data, loading, error, fetchOverview } = useGraphData();
+  const { data, loading, error, progress, fetchOverview } = useGraphData();
   const [highlightedIds, setHighlightedIds] = useState<Set<number> | null>(null);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
@@ -46,6 +68,22 @@ export function GraphTab({ project }: GraphTabProps) {
   const [leftWidth, setLeftWidth] = useState(() => loadWidth("cbm-left-w", 260));
   const [rightWidth, setRightWidth] = useState(() => loadWidth("cbm-right-w", 280));
   const limitNotice = formatGraphLimitNotice(data);
+
+  /* Node budget — keyed to its project so switching projects re-reads the
+   * persisted value and triggers exactly one fetch. */
+  const [budget, setBudget] = useState<{ project: string | null; value: number }>(
+    { project: null, value: GRAPH_RENDER_NODE_LIMIT },
+  );
+  const [budgetDraft, setBudgetDraft] = useState(String(GRAPH_RENDER_NODE_LIMIT));
+
+  const commitBudget = useCallback(() => {
+    const parsed = clampNodeBudget(parseInt(budgetDraft, 10));
+    setBudgetDraft(String(parsed));
+    if (project && parsed !== budget.value) {
+      saveNodeBudget(project, parsed);
+      setBudget({ project, value: parsed });
+    }
+  }, [budgetDraft, project, budget.value]);
 
   /* Filter state — all enabled by default */
   const [enabledLabels, setEnabledLabels] = useState<Set<string>>(new Set());
@@ -121,13 +159,23 @@ export function GraphTab({ project }: GraphTabProps) {
     hideTests,
   ]);
 
+  /* Re-read the persisted budget when the project changes… */
   useEffect(() => {
     if (project) {
-      fetchOverview(project);
+      const value = loadNodeBudget(project);
+      setBudget({ project, value });
+      setBudgetDraft(String(value));
+    }
+  }, [project]);
+
+  /* …and fetch only once budget and project agree (one fetch per change). */
+  useEffect(() => {
+    if (project && budget.project === project) {
+      fetchOverview(project, budget.value);
       setHighlightedIds(null);
       setSelectedPath(null);
     }
-  }, [project, fetchOverview]);
+  }, [project, budget, fetchOverview]);
 
   /* Fetch git remote metadata for GitHub deep-links */
   useEffect(() => {
@@ -236,10 +284,7 @@ export function GraphTab({ project }: GraphTabProps) {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-full">
-        <div className="text-center">
-          <div className="w-8 h-8 border-2 border-cyan-400/30 border-t-cyan-400 rounded-full animate-spin mx-auto mb-3" />
-          <p className="text-white/40 text-sm">Computing layout...</p>
-        </div>
+        <GraphLoader nodeBudget={budget.value} progress={progress} />
       </div>
     );
   }
@@ -355,7 +400,7 @@ export function GraphTab({ project }: GraphTabProps) {
               )}
             </div>
 
-            <div className="absolute top-4 right-4 flex gap-2">
+            <div className="absolute top-4 right-4 flex gap-2 items-center">
               {highlightedIds && (
                 <Button
                   size="sm"
@@ -369,6 +414,32 @@ export function GraphTab({ project }: GraphTabProps) {
                   Clear selection
                 </Button>
               )}
+              <div className="flex items-center gap-1.5 h-8 px-2 rounded-md border border-border/50 bg-[#0b1920]/80 backdrop-blur-sm">
+                <label
+                  htmlFor="node-budget"
+                  className="text-[10px] uppercase tracking-wider text-white/40"
+                >
+                  Nodes
+                </label>
+                <input
+                  id="node-budget"
+                  type="number"
+                  min={GRAPH_NODE_BUDGET_STEP}
+                  max={GRAPH_NODE_BUDGET_MAX}
+                  step={GRAPH_NODE_BUDGET_STEP}
+                  value={budgetDraft}
+                  onChange={(e) => setBudgetDraft(e.target.value)}
+                  onBlur={commitBudget}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.currentTarget.blur();
+                    }
+                  }}
+                  className="w-24 bg-transparent text-right text-xs font-mono text-cyan-200/90 outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                  aria-label="Node budget: how many nodes to load"
+                  title="How many nodes to load (5,000 steps, edges between loaded nodes follow automatically)"
+                />
+              </div>
               <Button
                 variant="outline"
                 size="sm"
@@ -377,7 +448,7 @@ export function GraphTab({ project }: GraphTabProps) {
                   setSelectedPath(null);
                   setSelectedNode(null);
                   setCameraTarget(null);
-                  fetchOverview(project);
+                  fetchOverview(project, budget.value);
                 }}
               >
                 Refresh
